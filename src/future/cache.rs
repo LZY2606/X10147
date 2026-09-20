@@ -11,6 +11,7 @@ use crate::{
     notification::AsyncEvictionListener,
     ops::compute::{self, CompResult},
     policy::{EvictionPolicy, ExpirationPolicy},
+    snapshot::CacheSnapshot,
     Entry, Policy, PredicateError,
 };
 
@@ -759,6 +760,71 @@ impl<K, V, S> Cache<K, V, S> {
     /// sample code.
     pub fn weighted_size(&self) -> u64 {
         self.base.weighted_size()
+    }
+
+    /// Returns a read-only, self-consistent [`CacheSnapshot`] of the cache's
+    /// policy state.
+    ///
+    /// The snapshot reports the configured capacity and eviction/expiration
+    /// policies, the observed entry count and weighted size, whether the
+    /// maintenance queues have work pending, and the logical maintenance
+    /// [generation](CacheSnapshot::generation) all of the estimates belong to.
+    ///
+    /// Taking a snapshot is cheap and side-effect free: it does not run
+    /// maintenance, does not evict entries or invoke the eviction listener, does
+    /// not advance the expiration clock, does not call a user-provided weigher,
+    /// and never blocks to drain the maintenance queues. It only performs a
+    /// small, fixed number of atomic loads, so it is a synchronous method even
+    /// though this cache is futures aware.
+    ///
+    /// The snapshot is not linearizable with concurrent cache writes, but its
+    /// [`entry_count`](CacheSnapshot::entry_count) and
+    /// [`weighted_size`](CacheSnapshot::weighted_size) are always read from the
+    /// same maintenance generation and carry the same
+    /// [`MetricAccuracy`](crate::snapshot::MetricAccuracy):
+    ///
+    /// - Before the first maintenance task has run, both are reported as zero
+    ///   with [`MetricAccuracy::Unmaintained`](crate::snapshot::MetricAccuracy::Unmaintained).
+    /// - When write operations are pending maintenance, they are
+    ///   [`MetricAccuracy::Approximate`](crate::snapshot::MetricAccuracy::Approximate).
+    /// - Otherwise they are [`MetricAccuracy::Exact`](crate::snapshot::MetricAccuracy::Exact) for the generation
+    ///   captured in the snapshot.
+    ///
+    /// Clones of this cache share the same generations; independently created
+    /// caches do not.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # async fn example() {
+    /// use moka::future::Cache;
+    /// use moka::snapshot::MetricAccuracy;
+    ///
+    /// let cache: Cache<u32, &str> = Cache::builder()
+    ///     .max_capacity(100)
+    ///     .build();
+    ///
+    /// // Right after insertion, maintenance has not observed the entry yet.
+    /// cache.insert(1, "one").await;
+    /// let pending = cache.snapshot();
+    /// assert_eq!(pending.generation(), 0);
+    /// assert_eq!(
+    ///     pending.entry_count().accuracy(),
+    ///     MetricAccuracy::Unmaintained
+    /// );
+    ///
+    /// // After maintenance runs with nothing else pending, the snapshot is
+    /// // exact.
+    /// cache.run_pending_tasks().await;
+    /// let settled = cache.snapshot();
+    /// assert!(settled.is_exact());
+    /// assert_eq!(settled.entry_count().value(), 1);
+    /// assert_eq!(settled.max_capacity(), Some(100));
+    /// # }
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(example());
+    /// ```
+    pub fn snapshot(&self) -> CacheSnapshot {
+        self.base.snapshot()
     }
 
     #[cfg(feature = "unstable-debug-counters")]
@@ -2097,6 +2163,9 @@ fn never_ignore<'a, V>() -> Option<&'a mut fn(&V) -> bool> {
 // To see the debug prints, run test as `cargo test -- --nocapture`
 #[cfg(test)]
 mod tests {
+    #[path = "snapshot_tests.rs"]
+    mod snapshot_tests;
+
     use super::Cache;
     use crate::{
         common::{time::Clock, HousekeeperConfig},

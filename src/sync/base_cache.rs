@@ -27,6 +27,7 @@ use crate::{
     },
     notification::{notifier::RemovalNotifier, EvictionListener, RemovalCause},
     policy::{EvictionPolicy, EvictionPolicyConfig, ExpirationPolicy},
+    snapshot::{CacheSnapshot, EvictionStrategy, Metric, MetricAccuracy},
     Entry, Expiry, Policy, PredicateError,
 };
 
@@ -41,7 +42,7 @@ use std::{
     hash::{BuildHasher, Hash},
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc,
     },
     time::{Duration, Instant as StdInstant},
@@ -93,6 +94,10 @@ impl<K, V, S> BaseCache<K, V, S> {
 
     pub(crate) fn weighted_size(&self) -> u64 {
         self.inner.weighted_size()
+    }
+
+    pub(crate) fn snapshot(&self) -> CacheSnapshot {
+        self.inner.take_snapshot()
     }
 
     pub(crate) fn is_map_disabled(&self) -> bool {
@@ -874,6 +879,11 @@ pub(crate) struct Inner<K, V, S> {
     max_capacity: Option<u64>,
     entry_count: AtomicCell<u64>,
     weighted_size: AtomicCell<u64>,
+    /// Seqlock-style generation counter guarding `entry_count` and
+    /// `weighted_size`. Odd while a maintenance task is publishing new
+    /// counters, even otherwise. The even value divided by two is the number
+    /// of completed maintenance generations.
+    maintenance_gen: AtomicU64,
     pub(crate) cache: CacheStore<K, V, S>,
     build_hasher: S,
     deques: Mutex<Deques<K>>,
@@ -929,6 +939,70 @@ impl<K, V, S> Inner<K, V, S> {
     #[inline]
     fn weighted_size(&self) -> u64 {
         self.weighted_size.load()
+    }
+
+    /// Reads `entry_count`, `weighted_size` and the maintenance generation as
+    /// one consistent unit using a seqlock protocol on `maintenance_gen`.
+    ///
+    /// This method never takes the policy locks, never drains a channel and
+    /// never calls user code.
+    fn read_counter_generation(&self) -> (u64, u64, u64) {
+        loop {
+            let gen_before = self.maintenance_gen.load(Ordering::Acquire);
+            let entry_count = self.entry_count.load();
+            let weighted_size = self.weighted_size.load();
+            let gen_after = self.maintenance_gen.load(Ordering::Acquire);
+
+            // Even generation means no maintenance task is publishing right
+            // now. Require the same even generation on both sides to ensure
+            // the two counters come from the same completed generation.
+            if gen_before == gen_after && gen_before % 2 == 0 {
+                return (entry_count, weighted_size, gen_before / 2);
+            }
+        }
+    }
+
+    fn take_snapshot(&self) -> CacheSnapshot {
+        let (entry_count, weighted_size, generation) = self.read_counter_generation();
+        // `pending_write_ops` is sampled after the counters: if a write lands
+        // exactly in this window, the snapshot is conservatively reported as
+        // approximate rather than falsely exact.
+        let pending_write_ops = self.write_op_ch.len();
+
+        let (entry_count, weighted_size) = if generation == 0 {
+            // No maintenance has run yet: the atomics are still zero and do not
+            // describe the live hash table. Do not pretend otherwise.
+            (
+                Metric::new(0, MetricAccuracy::Unmaintained),
+                Metric::new(0, MetricAccuracy::Unmaintained),
+            )
+        } else if pending_write_ops == 0 {
+            (
+                Metric::new(entry_count, MetricAccuracy::Exact),
+                Metric::new(weighted_size, MetricAccuracy::Exact),
+            )
+        } else {
+            (
+                Metric::new(entry_count, MetricAccuracy::Approximate),
+                Metric::new(weighted_size, MetricAccuracy::Approximate),
+            )
+        };
+
+        let eviction_strategy = match self.eviction_policy {
+            EvictionPolicyConfig::TinyLfu => EvictionStrategy::TinyLfu,
+            EvictionPolicyConfig::Lru => EvictionStrategy::Lru,
+        };
+
+        CacheSnapshot::new(
+            self.max_capacity,
+            eviction_strategy,
+            self.expiration_policy.time_to_live(),
+            self.expiration_policy.time_to_idle(),
+            entry_count,
+            weighted_size,
+            generation,
+            pending_write_ops,
+        )
     }
 
     #[inline]
@@ -1055,6 +1129,7 @@ where
             max_capacity,
             entry_count: AtomicCell::default(),
             weighted_size: AtomicCell::default(),
+            maintenance_gen: AtomicU64::new(0),
             cache,
             build_hasher,
             deques: Mutex::default(),
@@ -1314,9 +1389,14 @@ where
 
         debug_assert_eq!(self.entry_count.load(), current_ec);
         debug_assert_eq!(self.weighted_size.load(), current_ws);
+        // Publish the new counters under a seqlock-style generation: readers
+        // (see `take_snapshot`) see an odd generation while the two stores are
+        // in flight and retry, so they never observe a mixed pair.
+        self.maintenance_gen.fetch_add(1, Ordering::AcqRel);
         self.entry_count.store(eviction_state.counters.entry_count);
         self.weighted_size
             .store(eviction_state.counters.weighted_size);
+        self.maintenance_gen.fetch_add(1, Ordering::AcqRel);
 
         crossbeam_epoch::pin().flush();
 

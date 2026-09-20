@@ -235,12 +235,6 @@
 //! when one of the conditions in the [Bounded Channels](#bounded-channels) section
 //! is met.
 
-#[cfg(not(any(feature = "sync", feature = "future")))]
-compile_error!(
-    "At least one of the crate features `sync` or `future` must be enabled for \
-    `moka` crate. Please update your dependencies in Cargo.toml"
-);
-
 // Reexport(s)
 pub use equivalent::Equivalent;
 
@@ -268,6 +262,10 @@ pub mod ops;
 
 #[cfg(any(feature = "sync", feature = "future"))]
 pub mod policy;
+
+#[cfg(any(feature = "sync", feature = "future"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "sync", feature = "future"))))]
+pub mod snapshot;
 
 #[cfg(any(feature = "sync", feature = "future"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "sync", feature = "future"))))]
