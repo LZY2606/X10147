@@ -29,6 +29,7 @@ use crate::{
     future::CancelGuard,
     notification::{AsyncEvictionListener, RemovalCause},
     policy::{EvictionPolicy, EvictionPolicyConfig, ExpirationPolicy},
+    snapshot::{CacheSnapshot, MaintenanceStatus, SnapshotAccuracy, SnapshotValue},
     Entry, Expiry, Policy, PredicateError,
 };
 
@@ -40,6 +41,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use crossbeam_utils::atomic::AtomicCell;
 use equivalent::Equivalent;
 use futures_util::future::BoxFuture;
+use portable_atomic::AtomicU64;
 use smallvec::SmallVec;
 use std::{
     borrow::Borrow,
@@ -102,6 +104,10 @@ impl<K, V, S> BaseCache<K, V, S> {
 
     pub(crate) fn weighted_size(&self) -> u64 {
         self.inner.weighted_size()
+    }
+
+    pub(crate) fn snapshot(&self) -> CacheSnapshot {
+        self.inner.snapshot()
     }
 
     pub(crate) fn is_map_disabled(&self) -> bool {
@@ -1004,6 +1010,17 @@ pub(crate) struct Inner<K, V, S> {
     max_capacity: Option<u64>,
     entry_count: AtomicCell<u64>,
     weighted_size: AtomicCell<u64>,
+    /// A seqlock-style counter guarding `entry_count` and `weighted_size`.
+    ///
+    /// It is incremented to an odd value just before a maintenance run
+    /// publishes new counters and incremented again to an even value right
+    /// after, so each completed maintenance run advances it by two. Readers
+    /// can therefore detect an in-flight counter update and retry, and the
+    /// logical maintenance generation is obtained by halving an even value.
+    maintenance_seq: AtomicU64,
+    /// Set to `true` while a maintenance run (`do_run_pending_tasks`) is in
+    /// progress.
+    maintenance_running: AtomicBool,
     pub(crate) cache: CacheStore<K, V, S>,
     build_hasher: S,
     deques: Mutex<Deques<K>>,
@@ -1060,6 +1077,65 @@ impl<K, V, S> Inner<K, V, S> {
     #[inline]
     fn weighted_size(&self) -> u64 {
         self.weighted_size.load()
+    }
+
+    /// Takes a read-only snapshot of the cache's policy and maintenance state.
+    ///
+    /// This method never blocks on the maintenance queue, never invokes user
+    /// code (eviction listener, weigher or expiry), and does not read the
+    /// clock. See `CacheSnapshot` for the consistency guarantees.
+    fn snapshot(&self) -> CacheSnapshot {
+        // The number of attempts to read the counters consistently. We do not
+        // retry indefinitely as the snapshot must not block until the
+        // maintenance queue drains; on exhaustion we report the values as
+        // approximate.
+        const MAX_READ_ATTEMPTS: usize = 4;
+
+        let mut entry_count = 0;
+        let mut weighted_size = 0;
+        let mut generation = 0;
+        let mut is_consistent = false;
+
+        for _ in 0..MAX_READ_ATTEMPTS {
+            let seq1 = self.maintenance_seq.load(Ordering::Acquire);
+            entry_count = self.entry_count.load();
+            weighted_size = self.weighted_size.load();
+            let seq2 = self.maintenance_seq.load(Ordering::Acquire);
+            // The logical generation is the number of completed maintenance
+            // runs. (See the `maintenance_seq` field doc)
+            generation = seq2 / 2;
+            if seq1 == seq2 && seq1 % 2 == 0 {
+                is_consistent = true;
+                break;
+            }
+            std::hint::spin_loop();
+        }
+
+        let accuracy = if generation == 0 {
+            SnapshotAccuracy::Unmaintained
+        } else if is_consistent {
+            SnapshotAccuracy::Exact
+        } else {
+            SnapshotAccuracy::Approximate
+        };
+
+        let eviction_policy = EvictionPolicy {
+            config: self.eviction_policy.clone(),
+        };
+        let maintenance = MaintenanceStatus::new(
+            generation,
+            self.read_op_ch.len(),
+            self.write_op_ch.len(),
+            self.maintenance_running.load(Ordering::Acquire),
+        );
+
+        CacheSnapshot::new(
+            self.policy(),
+            eviction_policy,
+            SnapshotValue::new(entry_count, accuracy),
+            SnapshotValue::new(weighted_size, accuracy),
+            maintenance,
+        )
     }
 
     #[inline]
@@ -1198,6 +1274,8 @@ where
             max_capacity,
             entry_count: AtomicCell::default(),
             weighted_size: AtomicCell::default(),
+            maintenance_seq: AtomicU64::new(0),
+            maintenance_running: AtomicBool::new(false),
             cache,
             build_hasher,
             deques: Mutex::default(),
@@ -1320,6 +1398,8 @@ where
         if self.max_capacity == Some(0) {
             return false;
         }
+
+        self.maintenance_running.store(true, Ordering::Release);
 
         // Acquire some locks.
         let mut deqs = self.deques.lock().await;
@@ -1453,9 +1533,16 @@ where
 
         debug_assert_eq!(self.entry_count.load(), current_ec);
         debug_assert_eq!(self.weighted_size.load(), current_ws);
+        // Publish the new counters as a single logical generation. The odd
+        // value of `maintenance_seq` in between tells snapshot readers that
+        // the counters are being updated. (See the `maintenance_seq` field
+        // doc)
+        self.maintenance_seq.fetch_add(1, Ordering::AcqRel);
         self.entry_count.store(eviction_state.counters.entry_count);
         self.weighted_size
             .store(eviction_state.counters.weighted_size);
+        self.maintenance_seq.fetch_add(1, Ordering::AcqRel);
+        self.maintenance_running.store(false, Ordering::Release);
 
         crossbeam_epoch::pin().flush();
 

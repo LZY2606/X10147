@@ -11,6 +11,7 @@ use crate::{
     notification::AsyncEvictionListener,
     ops::compute::{self, CompResult},
     policy::{EvictionPolicy, ExpirationPolicy},
+    snapshot::CacheSnapshot,
     Entry, Policy, PredicateError,
 };
 
@@ -759,6 +760,60 @@ impl<K, V, S> Cache<K, V, S> {
     /// sample code.
     pub fn weighted_size(&self) -> u64 {
         self.base.weighted_size()
+    }
+
+    /// Returns a read-only, point-in-time snapshot of this cache's policy and
+    /// maintenance state.
+    ///
+    /// The snapshot is a best-effort, non-linearizable view of the live cache:
+    /// taking it does not pause concurrent writers, does not wait for the
+    /// maintenance queue to drain, and never invokes user code such as the
+    /// eviction listener, weigher or expiry. The observed `entry_count` and
+    /// `weighted_size` always come from the same logical maintenance
+    /// generation and are paired with a [`SnapshotAccuracy`][accuracy-enum]
+    /// telling whether they are exact, approximate, or not yet maintained.
+    ///
+    /// See the [`snapshot`][snapshot-mod] module for more details.
+    ///
+    /// [accuracy-enum]: ../snapshot/enum.SnapshotAccuracy.html
+    /// [snapshot-mod]: ../snapshot/index.html
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// // Cargo.toml
+    /// //
+    /// // [dependencies]
+    /// // tokio = { version = "1", features = ["rt-multi-thread", "macros" ] }
+    /// use moka::{future::Cache, snapshot::SnapshotAccuracy};
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let cache = Cache::new(100);
+    ///     cache.insert('n', "Netherland Dwarf").await;
+    ///
+    ///     // The insert above has not been processed by the cache's
+    ///     // maintenance yet, so the snapshot reports unmaintained estimates.
+    ///     let snapshot = cache.snapshot();
+    ///     assert_eq!(snapshot.maintenance_generation(), 0);
+    ///     assert_eq!(
+    ///         snapshot.entry_count().accuracy(),
+    ///         SnapshotAccuracy::Unmaintained
+    ///     );
+    ///
+    ///     // Run the pending maintenance tasks to publish a new generation.
+    ///     cache.run_pending_tasks().await;
+    ///
+    ///     let snapshot = cache.snapshot();
+    ///     assert_eq!(snapshot.maintenance_generation(), 1);
+    ///     assert_eq!(snapshot.entry_count().value(), 1);
+    ///     assert_eq!(snapshot.entry_count().accuracy(), SnapshotAccuracy::Exact);
+    ///     assert_eq!(snapshot.weighted_size().value(), 1);
+    /// }
+    /// ```
+    ///
+    pub fn snapshot(&self) -> CacheSnapshot {
+        self.base.snapshot()
     }
 
     #[cfg(feature = "unstable-debug-counters")]
@@ -5964,5 +6019,313 @@ mod tests {
             None,
             "key2 should expire with fresh TTL from expire_after_create"
         );
+    }
+
+    mod snapshot {
+        use super::*;
+        use crate::snapshot::SnapshotAccuracy;
+        use std::sync::atomic::AtomicBool;
+
+        #[tokio::test]
+        async fn unmaintained_until_first_maintenance() {
+            let mut cache = Cache::builder().max_capacity(100).build();
+            cache.reconfigure_for_testing().await;
+            let cache = cache;
+
+            cache.insert(0, "alice").await;
+
+            // The insert has not been maintained yet.
+            let snapshot = cache.snapshot();
+            assert_eq!(snapshot.maintenance_generation(), 0);
+            assert_eq!(snapshot.maintenance().generation(), 0);
+            assert!(!snapshot.maintenance().is_running());
+            assert_eq!(
+                snapshot.entry_count().accuracy(),
+                SnapshotAccuracy::Unmaintained
+            );
+            assert_eq!(
+                snapshot.weighted_size().accuracy(),
+                SnapshotAccuracy::Unmaintained
+            );
+            // The insert is still waiting in the maintenance queue.
+            assert!(snapshot.maintenance().has_pending_ops());
+            assert!(snapshot.maintenance().pending_write_ops() > 0);
+            assert!(snapshot.entry_count().value() <= 1);
+
+            cache.run_pending_tasks().await;
+
+            let snapshot = cache.snapshot();
+            assert_eq!(snapshot.maintenance_generation(), 1);
+            assert_eq!(snapshot.entry_count().value(), 1);
+            assert_eq!(snapshot.weighted_size().value(), 1);
+            assert_eq!(snapshot.entry_count().accuracy(), SnapshotAccuracy::Exact);
+            assert!(snapshot.entry_count().is_exact());
+            assert!(!snapshot.maintenance().has_pending_ops());
+            assert_eq!(snapshot.policy().max_capacity(), Some(100));
+            assert_eq!(snapshot.policy().time_to_live(), None);
+            assert_eq!(snapshot.policy().time_to_idle(), None);
+            // The default eviction policy is TinyLFU.
+            assert_eq!(
+                format!("{:?}", snapshot.eviction_policy()),
+                "EvictionPolicy::TinyLfu"
+            );
+        }
+
+        #[tokio::test]
+        async fn self_consistent_after_weighted_eviction() {
+            let mut cache = Cache::builder()
+                .max_capacity(10)
+                .weigher(|_k, _v| 5u32)
+                .eviction_policy(EvictionPolicy::lru())
+                .build();
+            cache.reconfigure_for_testing().await;
+            let cache = cache;
+
+            cache.insert(0, "a").await;
+            cache.insert(1, "b").await;
+            cache.insert(2, "c").await;
+            cache.run_pending_tasks().await;
+
+            let snapshot = cache.snapshot();
+            assert!(snapshot.entry_count().is_exact());
+            assert!(snapshot.weighted_size().is_exact());
+            // LRU admits all three entries (total weight 15) and then evicts
+            // down to the capacity of 10.
+            assert_eq!(snapshot.entry_count().value(), 2);
+            assert_eq!(snapshot.weighted_size().value(), 10);
+            // Self-consistency: every entry weighs 5 and the weight never
+            // exceeds the capacity.
+            assert_eq!(
+                snapshot.weighted_size().value(),
+                snapshot.entry_count().value() * 5
+            );
+            assert!(snapshot.weighted_size().value() <= snapshot.policy().max_capacity().unwrap());
+            assert_eq!(
+                format!("{:?}", snapshot.eviction_policy()),
+                "EvictionPolicy::Lru"
+            );
+        }
+
+        #[tokio::test]
+        async fn self_consistent_after_expiration() {
+            let (clock, mock) = Clock::mock();
+            let mut cache = Cache::builder()
+                .max_capacity(100)
+                .time_to_live(Duration::from_secs(30))
+                .clock(clock)
+                .build();
+            cache.reconfigure_for_testing().await;
+            let cache = cache;
+
+            cache.insert(0, "alice").await;
+            cache.run_pending_tasks().await;
+
+            let snapshot = cache.snapshot();
+            assert_eq!(snapshot.entry_count().value(), 1);
+            assert_eq!(
+                snapshot.policy().time_to_live(),
+                Some(Duration::from_secs(30))
+            );
+            let gen = snapshot.maintenance_generation();
+
+            // Advance the clock beyond the TTL and run the maintenance.
+            mock.increment(Duration::from_secs(31));
+            cache.run_pending_tasks().await;
+
+            let snapshot = cache.snapshot();
+            assert!(snapshot.maintenance_generation() > gen);
+            assert_eq!(snapshot.entry_count().value(), 0);
+            assert_eq!(snapshot.weighted_size().value(), 0);
+            assert!(snapshot.entry_count().is_exact());
+        }
+
+        #[tokio::test]
+        async fn self_consistent_after_explicit_invalidation() {
+            let mut cache = Cache::builder().max_capacity(100).build();
+            cache.reconfigure_for_testing().await;
+            let cache = cache;
+
+            cache.insert(0, "alice").await;
+            cache.run_pending_tasks().await;
+            let gen = cache.snapshot().maintenance_generation();
+
+            cache.invalidate(&0).await;
+
+            // The invalidation is queued but not maintained yet, so the
+            // snapshot still reports the previous generation.
+            let snapshot = cache.snapshot();
+            assert_eq!(snapshot.maintenance_generation(), gen);
+            assert!(snapshot.maintenance().pending_write_ops() > 0);
+            assert_eq!(snapshot.entry_count().value(), 1);
+
+            cache.run_pending_tasks().await;
+
+            let snapshot = cache.snapshot();
+            assert!(snapshot.maintenance_generation() > gen);
+            assert_eq!(snapshot.entry_count().value(), 0);
+            assert_eq!(snapshot.weighted_size().value(), 0);
+        }
+
+        #[tokio::test]
+        async fn generation_shared_across_clones() {
+            let mut cache = Cache::builder().max_capacity(100).build();
+            cache.reconfigure_for_testing().await;
+            let cache = cache;
+            let clone = cache.clone();
+
+            cache.insert(0, "alice").await;
+            clone.run_pending_tasks().await;
+
+            let s1 = cache.snapshot();
+            let s2 = clone.snapshot();
+            assert_eq!(s1.maintenance_generation(), 1);
+            assert_eq!(s1.maintenance_generation(), s2.maintenance_generation());
+            assert_eq!(s1.entry_count().value(), 1);
+            assert_eq!(s2.entry_count().value(), 1);
+        }
+
+        #[tokio::test]
+        async fn generation_not_shared_between_independent_caches() {
+            let cache1: Cache<i32, &str> = Cache::new(100);
+            let cache2: Cache<i32, &str> = Cache::new(100);
+
+            cache1.insert(0, "alice").await;
+            cache1.run_pending_tasks().await;
+
+            assert_eq!(cache1.snapshot().maintenance_generation(), 1);
+            assert_eq!(cache2.snapshot().maintenance_generation(), 0);
+            assert_eq!(
+                cache2.snapshot().entry_count().accuracy(),
+                SnapshotAccuracy::Unmaintained
+            );
+        }
+
+        #[tokio::test]
+        async fn isolated_from_listener_panic() {
+            let listener = |_k, _v, _cause| -> ListenerFuture {
+                async move { panic!("listener failed") }.boxed()
+            };
+            let mut cache = Cache::builder()
+                .max_capacity(1)
+                .async_eviction_listener(listener)
+                .build();
+            cache.reconfigure_for_testing().await;
+            let cache = cache;
+
+            cache.insert(0, "a").await;
+            cache.insert(1, "b").await;
+            // The eviction listener will panic during the maintenance, but
+            // the cache catches it; the snapshot must remain usable.
+            cache.run_pending_tasks().await;
+
+            let snapshot = cache.snapshot();
+            assert_eq!(snapshot.maintenance_generation(), 1);
+            assert!(snapshot.entry_count().is_exact());
+            assert!(snapshot.entry_count().value() <= 1);
+            assert!(snapshot.weighted_size().value() <= 1);
+        }
+
+        #[tokio::test]
+        async fn maintenance_running_visible_in_snapshot() {
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+
+            let listener = {
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                move |_k, _v, _cause| -> ListenerFuture {
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    .boxed()
+                }
+            };
+
+            let mut cache = Cache::builder()
+                .max_capacity(1)
+                .async_eviction_listener(listener)
+                .build();
+            cache.reconfigure_for_testing().await;
+            let cache = cache;
+
+            cache.insert(0, "a").await;
+            cache.insert(1, "b").await;
+
+            let maint_cache = cache.clone();
+            let handle = tokio::spawn(async move {
+                maint_cache.run_pending_tasks().await;
+            });
+
+            // Wait until the maintenance run reaches the eviction listener.
+            started.notified().await;
+
+            let snapshot = cache.snapshot();
+            assert!(snapshot.maintenance().is_running());
+            // The maintenance run has not completed, so the generation has
+            // not advanced yet.
+            assert_eq!(snapshot.maintenance_generation(), 0);
+
+            release.notify_one();
+            handle.await.unwrap();
+
+            let snapshot = cache.snapshot();
+            assert!(!snapshot.maintenance().is_running());
+            assert_eq!(snapshot.maintenance_generation(), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn self_consistent_under_concurrency() {
+            let cache = Cache::builder()
+                .max_capacity(1_000)
+                .weigher(|_k, _v| 2u32)
+                .build();
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut handles = Vec::new();
+
+            for t in 0..4u64 {
+                let cache = cache.clone();
+                let stop = Arc::clone(&stop);
+                handles.push(tokio::spawn(async move {
+                    let mut i = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        cache.insert((t, i), i).await;
+                        i += 1;
+                        if i % 64 == 0 {
+                            cache.run_pending_tasks().await;
+                        }
+                    }
+                }));
+            }
+
+            for n in 0..1_000 {
+                let snapshot = cache.snapshot();
+                let ec = snapshot.entry_count();
+                let ws = snapshot.weighted_size();
+                // The accuracy label must agree with the generation, and both
+                // counters must carry the same label.
+                assert_eq!(
+                    ec.accuracy() == SnapshotAccuracy::Unmaintained,
+                    snapshot.maintenance_generation() == 0
+                );
+                assert_eq!(ec.accuracy(), ws.accuracy());
+                if ec.is_exact() {
+                    // All entries weigh 2, so an exact snapshot must satisfy
+                    // this relation between the two counters.
+                    assert_eq!(ws.value(), ec.value() * 2);
+                }
+                if n % 100 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            stop.store(true, Ordering::Relaxed);
+            for h in handles {
+                h.await.unwrap();
+            }
+        }
     }
 }
